@@ -1,0 +1,173 @@
+<skill name="yp1k-emergence-investigation" version="1">
+
+  <purpose>
+    Investigate emergence gaps flagged by the YP1K Stage 1 diagnostic. This plan fires when
+    the main YP1K skill identifies a critical emergence gap and the pattern is planter_issue
+    or mixed. It provides the detailed breakdown — which fields, which hybrids, which drainage
+    conditions, and whether planting speed contributed — needed to give the grower a concrete
+    next step.
+
+    The goal of this investigation is not to replace the YP1K rate analysis. It is to answer
+    the question: is this a planter-wide problem, a hybrid-specific problem, or a field-condition
+    problem? The answer determines what the grower should do before next season.
+  </purpose>
+
+  <interpretation>
+
+    <section name="pattern-first">
+      Always start with the gap_result pattern from the analyze step. This is the highest-level
+      finding and determines how to frame everything else.
+
+      planter_issue (more than 80% of fields affected, gap consistent across all hybrids):
+        The planter is not delivering seeds as commanded. The gap is not selective — it affects
+        all hybrids roughly equally across all fields. This is a mechanical or calibration
+        problem, not a seed or environment problem. Root causes include meter calibration drift,
+        mechanical wear in seed disk or finger pickup, air pressure problems in pneumatic meters,
+        seed tube wear causing seed bounce and skip, or row unit bounce from operating at the
+        wrong speed for the planter type.
+
+      mixed (30 to 80% of fields affected, gap selective across hybrids or fields):
+        Some hybrids, varieties, or fields are affected but not all. This is a seed-environment
+        mismatch pattern. Likely causes include specific hybrids with harder seed coats that
+        perform poorly in cold or wet soils, specific fields with crusting or heavy residue,
+        or seed treatment interaction with cool soils (fungicide packages vary in cold-soil
+        efficacy). Identify which hybrids and fields are affected versus unaffected.
+
+      localized (fewer than 30% of fields affected):
+        Most of the data is valid. The affected zones likely have a field-specific explanation.
+        This sub-plan normally does not fire for localized patterns — if it does, focus on the
+        specific outlier fields and look for field-condition explanations.
+    </section>
+
+    <section name="hybrid-dimension">
+      Examine the gap_by_hybrid table. The key question: is the gap spread uniformly across
+      all hybrids, or is one hybrid driving the problem?
+
+      If gap is uniform across all hybrids (standard deviation small relative to mean):
+        This is a planter-wide signal. The equipment or operating conditions are the cause,
+        not anything hybrid-specific. Tell the grower: "The gap is consistent across all your
+        hybrids, which rules out seed performance as the cause."
+
+      If one or two hybrids have much higher gaps than others:
+        This is a hybrid-specific signal. The planter is likely working correctly — these
+        specific hybrids are not performing as well in your planting conditions. Tell the grower
+        which hybrids are affected and frame it as a seed-environment interaction to investigate.
+        Ask whether those hybrids were planted in different field conditions, on different dates,
+        or with different seed treatments.
+
+      If all hybrids have elevated gaps but the magnitude varies:
+        Mixed signal. The planter may have a baseline delivery problem AND some hybrids are
+        more sensitive than others. Present both dimensions.
+    </section>
+
+    <section name="field-and-drainage-dimension">
+      Examine gap_by_field and gap_by_drainage. These reveal whether the problem is spatially
+      or environmentally concentrated.
+
+      If the worst-gap fields share a drainage class:
+        Cold, wet, or poorly drained soils commonly cause worse emergence. Early-planted fields
+        in cold conditions are especially prone. Tell the grower: "The fields with the worst
+        emergence share [drainage class] drainage. Cold, wet conditions at planting can suppress
+        emergence in these soil types."
+
+      If the worst-gap fields are geographically clustered or share a field characteristic:
+        Look for a local explanation: tile failure, heavy residue mat, compaction layer. These
+        are field-specific conditions and do not indict the planter or the seed.
+
+      If gaps are uniformly bad across all drainage classes and field types:
+        Reinforces the planter-issue pattern. No environmental clustering means the problem
+        is not soil or weather driven — it is mechanical.
+    </section>
+
+    <section name="planting-speed">
+      If planting speed data is available, examine the speed_summary output carefully before
+      interpreting it. The correct interpretation depends on the planter type.
+
+      For operations using high-speed planter technology (Precision Planting SpeedTube, Deere
+      ExactEmerge, or similar hydraulic downforce systems):
+        These planters are engineered to perform at their designed operating speed, typically
+        5.5 to 7 or more miles per hour. Their hydraulic downforce systems continuously adjust
+        to maintain consistent seed-to-soil contact. At very slow speeds, these systems can
+        over-react to minor terrain variations, paradoxically reducing seed placement consistency.
+        If the data shows that lower speeds produced worse emergence, this is consistent with
+        high-speed planter behavior — planting too slowly on these machines degrades performance.
+        Tell the grower: "For high-speed planter technology, operating below the designed speed
+        can actually hurt emergence because the downforce control system over-corrects at slow
+        speeds. If these fields were planted at [speed] mph, that may be contributing to the gap."
+
+      For operations using conventional planters (without high-speed technology):
+        Traditional agronomic wisdom applies: slower is better, especially above 5 mph. On
+        conventional planters, higher speeds degrade seed spacing and depth uniformity.
+        If the data shows worse emergence at higher speeds, this is the expected pattern.
+        Do not generalize high-speed planter data to conventional equipment.
+
+      If planter type is unknown:
+        Present the speed data without a directional interpretation. Ask the grower what
+        planter they use before concluding anything about speed effects.
+
+      If no planting speed data is available:
+        Note the absence and ask the grower whether they have records of operating speed for
+        the affected fields. Speed data can be a key diagnostic for emergence problems.
+    </section>
+
+  </interpretation>
+
+  <communication>
+    This plan fires because a serious emergence problem was found. The grower may not know
+    the severity. Be direct and specific from the start.
+
+    Lead with the numbers: "Across your [crop_type] fields in [year], we are seeing an
+    emergence gap of [X,XXX] seeds/acre on average — that is [Normal/Minor/Warning/Critical]."
+
+    Name the pattern immediately: "The pattern is consistent across all your hybrids, which
+    points to a planter delivery problem" OR "The gap is concentrated in [specific hybrids
+    or fields], which suggests a seed-environment interaction."
+
+    Explain the implication: "If we adjusted seeding rates based on YP1K right now, we would
+    be building recommendations on an emerged stand that does not reflect what was planted.
+    Any rate increase would go through the same planter at the same reduced delivery rate.
+    The right move is to fix the root cause first, then re-run the YP1K analysis."
+
+    Give the grower a concrete next step. Do not end with "investigate the planter."
+    Say specifically: "I would recommend getting the planter meter calibrated and the seed
+    disk inspected before next season" OR "Check whether [specific hybrid] was planted in
+    different conditions — soil temperature, residue cover, or seed treatment differences
+    may explain the gap for that variety specifically."
+
+    If planting speed data shows a possible speed contribution, ask the question directly:
+    "What planter are you using, and what speed were you operating at on these fields?"
+    before concluding anything about speed effects.
+
+    Close by setting expectations for next steps:
+    "Once the [planter issue / seed selection / field condition] is addressed, run the YP1K
+    analysis again on next season's data. With corrected emergence, the rate recommendations
+    will be clean and actionable."
+  </communication>
+
+  <follow_up>
+    After presenting the emergence investigation findings, ask targeted questions based on
+    the pattern:
+
+    For planter_issue pattern:
+      "When was the planter meter last calibrated?"
+      "Has the seed disk been inspected this season?"
+      "Is this a high-speed planter (SpeedTube, ExactEmerge, or similar)? If so, at what
+      speed were these fields planted?"
+      "Was there any row-unit skip or bounce noticed during planting?"
+
+    For mixed pattern (hybrid-specific):
+      "Were [affected hybrids] planted at a different time or in different field conditions
+      than the hybrids that emerged well?"
+      "Did [affected hybrids] have a different seed treatment package?"
+      "What were the soil temperatures at planting for the affected versus unaffected fields?"
+
+    For drainage-correlated gaps:
+      "Were the [poorly/somewhat poorly] drained fields planted earlier in the spring when
+      soils were still cold?"
+      "Is there tile drainage in those fields, and is it functioning?"
+
+    Do not ask all of these questions at once. Read the data first, identify the most likely
+    explanation, and ask the one or two questions that would confirm or rule it out.
+  </follow_up>
+
+</skill>

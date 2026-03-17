@@ -1,0 +1,65 @@
+name: Sync Skills to S3
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'skills/**'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Validate skill YAML
+        run: |
+          pip install pyyaml
+          python3 -c "
+          import yaml, sys, os
+          errors = []
+          for root, dirs, files in os.walk('skills'):
+              for f in files:
+                  if f.endswith('.yaml'):
+                      path = os.path.join(root, f)
+                      try:
+                          with open(path) as fh:
+                              doc = yaml.safe_load(fh)
+                          if not doc.get('name'):
+                              errors.append(f'{path}: missing name')
+                          if not doc.get('steps') and 'references' not in root:
+                              errors.append(f'{path}: missing steps (non-reference plan)')
+                      except Exception as e:
+                          errors.append(f'{path}: {e}')
+          if errors:
+              for e in errors:
+                  print(f'ERROR: {e}', file=sys.stderr)
+              sys.exit(1)
+          print('All skill YAML files valid')
+          "
+
+      - name: Sync to S3
+        run: |
+          aws s3 sync skills/ s3://intelinair-chat-data/shared/global/skills/all/ \
+            --delete \
+            --exclude ".*" \
+            --include "*.yaml" \
+            --include "*.xml"
+
+      - name: Verify deployment
+        run: |
+          echo "Deployed skills:"
+          aws s3 ls s3://intelinair-chat-data/shared/global/skills/all/ --recursive \
+            | grep -E '\.(yaml|xml)$' \
+            | awk '{print $NF}'

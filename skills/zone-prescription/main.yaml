@@ -1,0 +1,105 @@
+name: zone-prescription
+description: >
+  Variable-rate prescription generator with zone map visualization.
+  Supports seed, nitrogen, and fertilizer prescriptions individually or
+  combined. Each prescription type adds a layer to the zone map and a
+  section to the downloadable ISOXML file. Users can fork this skill
+  and customize the rate logic for their operation.
+version: 1
+tags: [prescription, zone-map, variable-rate, seed, nitrogen, fertilizer, isoxml]
+scope: global
+author: system
+
+parameters:
+  year:
+    type: integer
+    description: Crop year
+    required: true
+    default: 2024
+  crop_type:
+    type: string
+    description: "'corn' or 'soybeans'"
+    required: true
+    default: corn
+  company_id:
+    type: string
+    description: Company ID filter (REQUIRED for performance)
+    required: true
+  prescription_types:
+    type: string
+    description: >
+      Comma-separated list of prescription types to generate.
+      Options: seed, nitrogen, fertilizer. Example: "seed,nitrogen"
+    required: true
+    default: "seed"
+  field_name:
+    type: string
+    description: Optional field name filter (omit for all fields)
+    required: false
+
+steps:
+  # Step 1: Query zone geometry + field properties (shared base for all prescriptions)
+  - step: 1
+    id: base_query
+    tool: query
+    output_table: temp_rx_zones
+    timeout_ms: 30000
+    output: workspace
+    arguments:
+      sql: |
+        SELECT
+          CAST(fp.zone_id AS VARCHAR) as zone_id,
+          CAST(fp.field_id AS VARCHAR) as field_id,
+          CAST(fp.company_id AS VARCHAR) as company_id,
+          fp.field_name, fp.field_token,
+          fp.centroid_lat, fp.centroid_lon, fp.acres,
+          fp.soil_type, fp.soil_productivity, fp.drainage_class,
+          fp.water_holding_capacity, fp.elevation, fp.slope,
+          fp.harvest_yield, fp.crop_type,
+          ST_AsText(fp.zone_geometry) as geometry_wkt
+        FROM field_properties fp
+        WHERE fp.year = {{ year }}
+          AND CAST(fp.company_id AS VARCHAR) = '{{ company_id }}'
+          AND fp.crop_type = '{{ crop_type }}'
+          AND fp.zone_geometry IS NOT NULL
+      table_name: temp_rx_zones
+
+  # Step 2: Render the combined zone map with all prescription layers
+  # This runs AFTER hooks have added rec_* columns to temp_rx_zones
+  - step: 2
+    id: render_map
+    tool: render
+    input_tables: [temp_rx_zones]
+    timeout_ms: 60000
+    output: panel
+    arguments:
+      component: zone-map
+      source_table: temp_rx_zones
+      color_by: harvest_yield
+      title: "Variable-Rate Prescription — {{ crop_type }} {{ year }}"
+
+hooks:
+  # Chain reference plans based on prescription_types parameter
+  - after: base_query
+    condition: "{{ prescription_types }} contains \"seed\""
+    execute: references/seed
+    parameters:
+      year: "{{ year }}"
+      crop_type: "{{ crop_type }}"
+      company_id: "{{ company_id }}"
+
+  - after: base_query
+    condition: "{{ prescription_types }} contains \"nitrogen\""
+    execute: references/nitrogen
+    parameters:
+      year: "{{ year }}"
+      crop_type: "{{ crop_type }}"
+      company_id: "{{ company_id }}"
+
+  - after: base_query
+    condition: "{{ prescription_types }} contains \"fertilizer\""
+    execute: references/fertilizer
+    parameters:
+      year: "{{ year }}"
+      crop_type: "{{ crop_type }}"
+      company_id: "{{ company_id }}"

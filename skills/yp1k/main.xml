@@ -1,0 +1,187 @@
+<skill name="yp1k" version="6">
+
+  <purpose>
+    Analyze seeding rate optimization using the Yield Per 1,000 plants (YP1K) diagnostic.
+    YP1K measures how hard each plant is working: YP1K = Harvest Yield / (Emerged Stand / 1,000).
+    A high YP1K means plants are maximized and the field has room for more. A low YP1K means
+    plants are competing with each other.
+
+    Use this skill when a grower asks about seeding rates, population optimization, whether they
+    are over- or under-seeded, or how their seed program is performing relative to yield outcomes.
+
+    The skill is two-stage by design. Stage 1 checks emergence quality before any rate recommendation
+    is made. Adding seed onto a field with a planter problem is the wrong answer — Stage 1 enforces
+    that discipline. Stage 2 computes YP1K per hybrid and generates rate adjustment recommendations.
+
+    Do not skip Stage 1. Do not shortcut to rate recommendations without reviewing emergence first.
+    This is the invariant the whole workflow depends on.
+  </purpose>
+
+  <interpretation>
+
+    <stage name="emergence" label="Stage 1 — Emergence Diagnostic">
+      The analyze step (step 2) runs compute_yp1k which adds an emerged_stand column and a gap
+      column. Gap = planting_population - emerged_stand. The detect_gap_pattern primitive
+      classifies the operation-wide pattern.
+
+      Read the gap_result output from step 2 to determine severity and pattern before reading
+      any YP1K numbers.
+
+      Corn emergence gap thresholds:
+        Normal    — gap below 1,000 seeds/ac: Proceed to Stage 2 without caveats.
+        Minor     — gap 1,000 to 2,000: Elevated. Note and monitor. Proceed.
+        Warning   — gap 2,000 to 3,000: Significant. Investigate before recommending rate changes.
+        Critical  — gap above 3,000: Serious. Fix the root cause first. Do not recommend rate changes.
+
+      Soybean emergence gap thresholds:
+        Normal    — gap below 5,000 seeds/ac: Proceed to Stage 2 without caveats.
+        Minor     — gap 5,000 to 10,000: Elevated. Note and monitor. Proceed.
+        Warning   — gap 10,000 to 15,000: Significant. Investigate before recommending rate changes.
+        Critical  — gap above 15,000: Serious. Fix the root cause first. Do not recommend rate changes.
+
+      Pattern interpretation (from detect_gap_pattern):
+        planter_issue — more than 80% of fields and zones have elevated gaps. The problem is
+          uniform across all hybrids. This is a planter delivery problem, not a hybrid or
+          environment problem. Do not recommend rate changes. Investigate the planter.
+        mixed — 30 to 80% of fields have elevated gaps. Some hybrids or fields are affected.
+          Likely seed-environment interaction. Exclude affected hybrids from rate recommendations.
+          Present YP1K analysis for the unaffected hybrids.
+        localized — fewer than 30% of fields have elevated gaps. Most data is valid. Proceed
+          to Stage 2 with a light note about the isolated outliers.
+
+      When gap is critical and pattern is planter_issue: stop the analysis at Stage 1. Tell
+      the grower what was found, explain why rate recommendations cannot be made on top of a
+      delivery problem, and direct them to investigate the planter before next season. The
+      emergence investigation reference plan (references/emergence) provides the deeper framework.
+
+      When gap is critical and pattern is mixed: proceed to Stage 2 but exclude the affected
+      hybrids from rate recommendations. Flag them separately with a note.
+
+      When gap is at warning level: proceed to Stage 2 with an explicit caveat that the emergence
+      data has uncertainty and recommendations should be monitored before committing to changes.
+    </stage>
+
+    <stage name="yp1k" label="Stage 2 — YP1K Rate Optimization">
+      After emergence clears the gate, interpret the YP1K values per hybrid from the step 2
+      output. Always evaluate at the hybrid level first. The operation-level overall YP1K is a
+      summary — rate changes must be hybrid-specific.
+
+      Corn YP1K decision table:
+        Above 8.5         — Significantly under-seeded. Add 4,000 to 5,000 seeds/ac.
+        8.0 to 8.4        — Under-seeded. Add 3,000 to 4,000 seeds/ac.
+        7.5 to 7.9        — Slightly under-seeded. Add 1,000 to 2,000 seeds/ac.
+        7.0 to 7.5        — Optimal. Hold current rate.
+        6.5 to 6.9        — Slightly over-seeded. Reduce 1,000 to 2,000 seeds/ac.
+        Below 6.5         — Over-seeded. Reduce 2,000 to 3,000 seeds/ac.
+
+      Soybean YP1K decision table:
+        Above 0.65        — Significantly under-seeded. Add 15,000 to 20,000 seeds/ac.
+        0.55 to 0.65      — Under-seeded. Add 10,000 to 15,000 seeds/ac.
+        0.50 to 0.55      — Slightly under-seeded. Add 5,000 to 10,000 seeds/ac.
+        0.45 to 0.50      — Optimal. Hold current rate.
+        0.40 to 0.45      — Slightly over-seeded. Reduce 5,000 to 10,000 seeds/ac.
+        Below 0.40        — Over-seeded. Reduce 10,000 to 15,000 seeds/ac.
+
+      Field-type target adjustment — the optimal band shifts by field quality:
+        Best ground       — Corn YP1K 7.0 to 7.25. Soil can support competition.
+        Average ground    — Corn YP1K 7.25 to 7.5. Balanced risk and reward.
+        Droughty ground   — Corn YP1K 7.5 to 8.0. Buffer against dry-year stress.
+        Irrigated         — Corn YP1K 6.8 to 7.0. Water removes competition constraint.
+      Soybeans shift similarly: adjust the optimal band by plus or minus 0.03 to 0.05 for
+      field type. A corn YP1K of 7.6 on droughty ground is within target for that field type
+      even though the standard table labels it slightly_under. Always apply field-type context.
+
+      Multi-year stability caveat: a single year's YP1K, especially in a drought year, is not
+      sufficient justification for a permanent rate change. In a drought year yield drops more
+      than stand count, inflating YP1K even at the correct population. Do not recommend a
+      permanent rate reduction from a single stress-year observation. Require at least two
+      seasons of data or cross-reference with the aggregate database.
+
+      The render step (step 3) composes the shared YP1K UI templates directly from the
+      workspace table. It produces the same heatmaps, field summary, economics, placement,
+      and agronomics surfaces the user sees in the panel. Those same template parts can be
+      rendered independently in other skills; this skill just uses the full dashboard shape.
+      The step 2 text output is for the agent's reasoning and for hook metadata only.
+    </stage>
+
+  </interpretation>
+
+  <communication>
+    Lead with the finding. Do not bury the headline in caveats. State the overall YP1K first,
+    then the hybrid breakdown, then the adjustments.
+
+    Use economic framing to make recommendations concrete, but follow these rules:
+      Never hard-code returns. Seed cost and grain price change every year. Say "at illustrative
+      assumptions" or "at your seed cost" rather than stating a guaranteed dollar figure.
+      The directional logic is what matters — under-seeding costs yield, over-seeding wastes seed.
+      Always show both sides of the economic case: seed cost delta AND expected yield effect.
+      Scale to the operation. A $12/ac finding on 500 acres is $6,000 — use the actual acreage.
+
+    Never recommend a rate change without checking emergence first. The two-stage structure
+    is the only credible path. If asked for a quick rate recommendation before emergence is
+    reviewed, decline politely and explain why the gate exists.
+
+    Never present the same rate change for all fields. Some fields are best ground that
+    supports higher population; others are droughty and benefit from fewer plants. Segment
+    before prescribing.
+
+    Never compare a grower's YP1K to their neighbor's operation. The data tells each farmer
+    what is right for their fields — not what is right for someone else's soils and hybrids.
+
+    Never recommend a population change based on a single stress year's data without flagging
+    the caveat explicitly.
+
+    When all hybrids are optimal, say so plainly and shift the conversation. "Your rates are
+    dialed in. No changes recommended. Here is what that means for next season." Do not
+    manufacture urgency where none exists.
+
+    When emergence is critical, be direct and specific: state the gap number, name the pattern,
+    explain the cause, and give the grower a concrete next step. Do not say "I found a problem"
+    without telling them what it is and what to do about it.
+  </communication>
+
+  <follow_up>
+    After presenting findings, the conversation branches based on what was found:
+
+    If emergence is critical and pattern is planter_issue:
+      Do not proceed to rate recommendations. Direct the grower toward planter investigation.
+      Say: "Before we look at seeding rates, I want to flag something. Across your [crop_type]
+      fields, we are seeing an emergence gap of [X,XXX] seeds/acre — that is [severity]. This
+      pattern is consistent across all your hybrids, which points to the planter rather than
+      any specific seed. Adding more seed right now would go through the same planter at the
+      same reduced rate. I would recommend getting the planter checked before next season and
+      then running this analysis again on corrected data."
+      The hooks section automatically fires the emergence reference plan in this case.
+
+    If under-seeded patterns found (most hybrids above target YP1K):
+      Present the hybrid-by-hybrid breakdown from the step 2 output and the dashboard (step 3).
+      Offer to generate field-level prescriptions: "I can generate zone-specific rate
+      prescriptions with recommended populations by drainage class. Want me to run that?"
+
+    If over-seeded patterns found (most hybrids below target YP1K):
+      Present the economics of the seed cost savings first. Check whether this is a drought-year
+      artifact before recommending a permanent rate cut.
+
+    If mixed results (some hybrids optimal, some not):
+      Segment by field type and drainage class before presenting recommendations. A hybrid
+      at YP1K 7.6 on droughty ground is in target for that field type — do not apply the
+      standard table without field-type context.
+
+    If all hybrids are optimal:
+      Present the "dialed in" summary. Check whether certain fields are at the edges of the
+      optimal band and whether those match their expected field type. Shift the conversation
+      to other variables: hybrid selection, fertility, drainage.
+  </follow_up>
+
+  <references>
+    <plan name="emergence"
+          path="references/emergence"
+          trigger="emergence gap critical — gap above corn 3,000 or soy 15,000 seeds/ac, with planter_issue pattern"
+          description="Deeper emergence investigation: identifies which fields and hybrids are most affected, checks for planting speed effects (high-speed planter context), correlates gap with drainage class and field conditions, builds the case for a planter audit." />
+    <plan name="placement"
+          path="references/placement"
+          trigger="under-seeded hybrids detected — one or more hybrids above the optimal YP1K range with valid emergence"
+          description="Field-level prescription generation: queries aggregate database for hybrid-specific optimal rates by drainage class, maps prescriptions to field zones, builds variable-rate prescription table exportable as ISOXML." />
+  </references>
+
+</skill>

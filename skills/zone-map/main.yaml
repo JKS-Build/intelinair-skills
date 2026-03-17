@@ -1,0 +1,122 @@
+name: zone-map-prescription
+description: >
+  Variable-rate seeding prescription generator. Queries zone geometry with yield
+  and planting data, computes drainage-stratified optimal rates, generates
+  per-zone recommendations, builds prescription map, and exports ISOXML
+  for John Deere equipment.
+version: 2
+
+parameters:
+  year:
+    type: integer
+    required: true
+  crop_type:
+    type: string
+    required: true
+  company_id:
+    type: string
+    required: true
+
+steps:
+  - step: 1
+    tool: query
+    output_table: temp_zones
+    timeout_ms: 30000
+    output: workspace
+    arguments:
+      sql: |
+        SELECT
+          CAST(fp.zone_id AS VARCHAR) as zone_id,
+          CAST(fp.field_id AS VARCHAR) as field_id,
+          CAST(fp.company_id AS VARCHAR) as company_id,
+          fp.field_name, fp.field_token,
+          fp.centroid_lat, fp.centroid_lon, fp.acres,
+          fp.soil_productivity, fp.drainage_class,
+          fp.harvest_yield, fp.crop_type,
+          ST_AsText(fp.zone_geometry) as geometry_wkt,
+          p.hybrid, p.brand, p.planting_population, p.seeding_rate
+        FROM field_properties fp
+        LEFT JOIN planting_events p
+          ON fp.field_id = p.field_id AND fp.zone_id = p.zone_id AND fp.year = p.year
+        WHERE fp.year = {{ year }}
+          AND CAST(fp.company_id AS VARCHAR) = '{{ company_id }}'
+          AND fp.crop_type = '{{ crop_type }}'
+          AND fp.zone_geometry IS NOT NULL
+      table_name: temp_zones
+
+  - step: 2
+    tool: analyze
+    input_tables: [temp_zones]
+    timeout_ms: 60000
+    output: agent
+    arguments:
+      table: temp_zones
+      raw_mode: true
+      code: |
+        # Load full data
+        df = sql_df('SELECT * FROM "temp_zones"')
+        df = df.reset_index(drop=True)
+
+        # Compute YP1K and field tiers
+        df = compute_yp1k(df, crop_type='{{ crop_type }}')
+        field_tiers = categorize_fields(df)
+
+        is_corn = '{{ crop_type }}' == 'corn'
+        POP_MIN = 28000 if is_corn else 100000
+        POP_MAX = 40000 if is_corn else 200000
+        POP_STEP = 1000 if is_corn else 10000
+
+        # Find optimal population per drainage class from the data
+        dc_groups = {}
+        for _, row in df.iterrows():
+            dc = row.get('drainage_class') or 'Unknown'
+            pop = float(row.get('planting_population') or 0)
+            yld = float(row.get('harvest_yield') or 0)
+            ac = float(row.get('acres') or 1)
+            if yld <= 0 or pop < POP_MIN or pop > POP_MAX:
+                continue
+            bucket = round(pop / POP_STEP) * POP_STEP
+            key = (dc, bucket)
+            if key not in dc_groups:
+                dc_groups[key] = {'yield_sum': 0, 'acres_sum': 0, 'count': 0}
+            g = dc_groups[key]
+            g['yield_sum'] += yld * ac
+            g['acres_sum'] += ac
+            g['count'] += 1
+
+        dc_opt = {}
+        for (dc, bucket), g in dc_groups.items():
+            if g['count'] >= 2:
+                avg_yld = g['yield_sum'] / g['acres_sum']
+                if dc not in dc_opt or avg_yld > dc_opt[dc][0]:
+                    dc_opt[dc] = (avg_yld, bucket)
+
+        # Assign recommended rate per zone
+        tier_defaults = {'A': 36000, 'B': 34000, 'C': 32000, 'D': 30000} if is_corn else {'A': 140000, 'B': 130000, 'C': 120000, 'D': 110000}
+
+        def recommend(row):
+            dc = row.get('drainage_class') or 'Unknown'
+            tier = field_tiers.get(row.get('field_name',''), {}).get('tier', 'B')
+            base = dc_opt.get(dc, (0, tier_defaults.get(tier, 34000 if is_corn else 130000)))[1]
+            return max(POP_MIN, min(POP_MAX, base))
+
+        df['rec_pop'] = df.apply(recommend, axis=1)
+        df['current_pop'] = df['planting_population'].fillna(df['rec_pop'].median()).astype(float)
+        df['pop_change'] = df['rec_pop'] - df['current_pop']
+
+        # Generate ISOXML prescription
+        prescriptions = [{'grid_id': str(r['zone_id']), 'rate': float(r['rec_pop']),
+                          'unit': 'seeds/ac', 'geometry': str(r.get('geometry_wkt',''))}
+                         for _, r in df.iterrows() if r.get('geometry_wkt')]
+        to_isoxml(prescriptions, f'prescription_{{ crop_type }}_{{ year }}.xml',
+                  product_name=f'{{ crop_type }} Seed'.title(), task_name=f'VR Seeding {{ year }}')
+
+        # Summary
+        total_zones = len(df)
+        zones_changed = int((df['pop_change'].abs() > (500 if is_corn else 3000)).sum())
+        crop_label = 'Corn' if is_corn else 'Soybean'
+        print(f"=== Zone Prescription: {crop_label} {{ year }} ===")
+        print(f"Zones: {total_zones:,} | Fields: {df['field_name'].nunique()} | Acres: {df['acres'].sum():,.0f}")
+        print(f"Zones with rate change: {zones_changed} ({round(zones_changed/total_zones*100) if total_zones else 0}%)")
+        print(f"ISOXML file generated: prescription_{{ crop_type }}_{{ year }}.xml")
+        print(f"Download available above.")

@@ -1,0 +1,149 @@
+name: yp1k-emergence-investigation
+description: >
+  Deeper emergence investigation triggered when YP1K Stage 1 flags a critical gap.
+  Identifies which fields and hybrids are most affected, checks for planting speed
+  effects, and correlates gap with drainage class and field conditions.
+version: 1
+
+parameters:
+  year:
+    type: integer
+    required: true
+  crop_type:
+    type: string
+    required: true
+  company_id:
+    type: string
+    required: true
+
+steps:
+  - step: 1
+    tool: query
+    output_table: temp_emergence_detail
+    timeout_ms: 30000
+    expected_parameters: [year, crop_type, company_id]
+    output: workspace
+    arguments:
+      sql: |
+        SELECT
+          CAST(p.field_id AS VARCHAR) as field_id,
+          CAST(p.zone_id AS VARCHAR) as zone_id,
+          p.year, p.hybrid, p.brand,
+          p.planting_population, p.seeding_rate,
+          p.crop_type, p.field_name, p.field_token,
+          CAST(p.company_id AS VARCHAR) as company_id, p.company_name,
+          p.harvest_yield,
+          fp.drainage_class, fp.soil_type, fp.soil_productivity,
+          fp.acres, fp.county, fp.state,
+          img.percent_emerged,
+          img.planting_speed_mph
+        FROM planting_events p
+        JOIN field_properties fp
+          ON p.field_id = fp.field_id AND p.zone_id = fp.zone_id AND p.year = fp.year
+        LEFT JOIN (
+          SELECT
+            field_id, zone_id, year,
+            MAX(percent_emerged) as percent_emerged,
+            AVG(planting_speed_mph) as planting_speed_mph
+          FROM imagery_events
+          WHERE percent_emerged IS NOT NULL
+          GROUP BY field_id, zone_id, year
+        ) img ON p.field_id = img.field_id AND p.zone_id = img.zone_id AND p.year = img.year
+        WHERE p.year = {{ year }}
+          AND p.planting_population > 0
+          AND CAST(p.company_id AS VARCHAR) = '{{ company_id }}'
+          AND p.crop_type = '{{ crop_type }}'
+          AND (
+            ('{{ crop_type }}' = 'corn' AND p.planting_population BETWEEN 28000 AND 40000)
+            OR
+            ('{{ crop_type }}' = 'soybeans' AND p.planting_population BETWEEN 100000 AND 200000)
+          )
+      table_name: temp_emergence_detail
+
+  - step: 2
+    tool: analyze
+    input_tables: [temp_emergence_detail]
+    timeout_ms: 60000
+    expected_parameters: [crop_type]
+    output: agent
+    arguments:
+      table: temp_emergence_detail
+      raw_mode: true
+      code: |
+        df = sql_df('SELECT * FROM "temp_emergence_detail"')
+        df = df.reset_index(drop=True)
+
+        # Compute emerged stand and gap using injected primitives
+        df = compute_yp1k(df, crop_type='{{ crop_type }}')
+
+        # Operation-wide gap pattern
+        gap_result = detect_gap_pattern(df, '{{ crop_type }}')
+
+        # Gap by hybrid — identifies whether problem is hybrid-specific or planter-wide
+        gap_by_hybrid = (
+            df.groupby('hybrid')['gap']
+            .agg(['mean', 'std', 'count'])
+            .rename(columns={'mean': 'avg_gap', 'std': 'std_gap', 'count': 'zones'})
+            .sort_values('avg_gap', ascending=False)
+        )
+
+        # Gap by field — identifies which specific fields are most affected
+        gap_by_field = (
+            df.groupby(['field_name', 'drainage_class'])['gap']
+            .agg(['mean', 'count'])
+            .rename(columns={'mean': 'avg_gap', 'count': 'zones'})
+            .sort_values('avg_gap', ascending=False)
+        )
+
+        # Gap by drainage class — cold, wet soils often cause more emergence loss
+        gap_by_drainage = (
+            df.groupby('drainage_class')['gap']
+            .agg(['mean', 'count'])
+            .rename(columns={'mean': 'avg_gap', 'count': 'zones'})
+            .sort_values('avg_gap', ascending=False)
+        )
+
+        # Planting speed analysis (if available)
+        has_speed_data = df['planting_speed_mph'].notna().any()
+        speed_summary = None
+        if has_speed_data:
+            speed_buckets = df.dropna(subset=['planting_speed_mph']).copy()
+            speed_buckets['speed_band'] = (speed_buckets['planting_speed_mph'] // 0.5 * 0.5)
+            speed_summary = (
+                speed_buckets.groupby('speed_band')
+                .agg(
+                    avg_emergence=('percent_emerged', 'mean'),
+                    avg_gap=('gap', 'mean'),
+                    zones=('gap', 'count'),
+                )
+                .sort_values('speed_band')
+            )
+
+        crop_label = 'Corn' if '{{ crop_type }}' == 'corn' else 'Soybean'
+        critical_threshold = 3000 if '{{ crop_type }}' == 'corn' else 15000
+
+        print(f"=== Emergence Investigation: {crop_label} {{ year }} ===")
+        print(f"Overall pattern: {gap_result['pattern']} — avg gap {gap_result['avg_gap']:,.0f} seeds/ac")
+        print(f"Critical threshold: {critical_threshold:,} seeds/ac")
+        print()
+
+        print("--- Gap by Hybrid (descending) ---")
+        print(gap_by_hybrid.to_string())
+        print()
+
+        print("--- Gap by Field (top 10 most affected) ---")
+        print(gap_by_field.head(10).to_string())
+        print()
+
+        print("--- Gap by Drainage Class ---")
+        print(gap_by_drainage.to_string())
+        print()
+
+        if speed_summary is not None:
+            print("--- Planting Speed vs Emergence ---")
+            print(speed_summary.to_string())
+            print()
+            print("NOTE: If this operation uses high-speed planter technology, review the")
+            print("speed effect interpretation in the emergence instructions (main.xml).")
+        else:
+            print("Planting speed data not available for this dataset.")

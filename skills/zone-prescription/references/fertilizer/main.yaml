@@ -1,0 +1,146 @@
+name: fertilizer-prescription
+description: >
+  Variable-rate fertilizer (P/K) prescription based on yield removal
+  and soil productivity. Adds rec_fertilizer_lbs column to workspace
+  table and exports ISOXML.
+version: 1
+
+steps:
+  - step: 1
+    id: fertilizer_compute
+    tool: analyze
+    input_tables: [temp_rx_zones]
+    timeout_ms: 60000
+    output: agent
+    arguments:
+      table: temp_rx_zones
+      raw_mode: true
+      code: |
+        import json
+
+        # Load zone data
+        zones = sql_df('SELECT * FROM "temp_rx_zones"')
+        zones = zones.reset_index(drop=True)
+
+        is_corn = '{{ crop_type }}' == 'corn'
+
+        # Query fertilizer application history
+        apps = sql_df("""
+          SELECT
+            CAST(a.zone_id AS VARCHAR) as zone_id,
+            a.as_applied_rate,
+            a.harvest_yield as app_yield,
+            a.product_types,
+            a.category_names,
+            a.fertilizer_products
+          FROM application_events a
+          WHERE a.year = {{ year }}
+            AND CAST(a.company_id AS VARCHAR) = '{{ company_id }}'
+            AND a.crop_type = '{{ crop_type }}'
+            AND a.as_applied_rate > 0
+            AND (
+              a.fertilizer_products IS NOT NULL
+              OR a.product_types LIKE '%fertilizer%'
+            )
+        """)
+
+        # Query soil test data if available
+        soil_tests = None
+        try:
+            soil_tests = sql_df("""
+              SELECT
+                CAST(zone_id AS VARCHAR) as zone_id,
+                *
+              FROM soil_test_events
+              WHERE year >= {{ year }} - 2
+                AND CAST(company_id AS VARCHAR) = '{{ company_id }}'
+            """)
+            if len(soil_tests) == 0:
+                soil_tests = None
+        except:
+            soil_tests = None
+
+        # Merge application data
+        if len(apps) > 0:
+            fert_rates = apps.groupby('zone_id').agg(
+                applied_fert_rate=('as_applied_rate', 'max'),
+                fert_yield=('app_yield', 'max')
+            ).reset_index()
+            zones = zones.merge(fert_rates, on='zone_id', how='left')
+        else:
+            zones['applied_fert_rate'] = None
+            zones['fert_yield'] = None
+
+        # Yield-based nutrient removal rates (lbs per bushel)
+        # P2O5: corn 0.37 lb/bu, soybean 0.80 lb/bu
+        # K2O:  corn 0.27 lb/bu, soybean 1.40 lb/bu
+        if is_corn:
+            P_REMOVAL = 0.37  # lbs P2O5 per bu corn
+            K_REMOVAL = 0.27  # lbs K2O per bu corn
+            FERT_MIN, FERT_MAX = 30, 200
+        else:
+            P_REMOVAL = 0.80  # lbs P2O5 per bu soybean
+            K_REMOVAL = 1.40  # lbs K2O per bu soybean
+            FERT_MIN, FERT_MAX = 40, 250
+
+        def get_tier(sp):
+            sp = float(sp or 0)
+            if sp > 0.82: return 'A'
+            if sp > 0.72: return 'B'
+            if sp > 0.62: return 'C'
+            return 'D'
+
+        # Tier adjustment: lower productivity soils may need build-up
+        tier_multiplier = {'A': 1.0, 'B': 1.05, 'C': 1.15, 'D': 1.25}
+
+        def recommend_fert(row):
+            yld = float(row.get('harvest_yield') or 0)
+            tier = get_tier(row.get('soil_productivity'))
+            mult = tier_multiplier.get(tier, 1.1)
+
+            if yld <= 0:
+                # No yield data — use tier-based defaults
+                defaults = {'A': 80, 'B': 90, 'C': 100, 'D': 110} if is_corn else \
+                           {'A': 100, 'B': 110, 'C': 120, 'D': 130}
+                return defaults.get(tier, 90 if is_corn else 110)
+
+            # Maintenance rate: replace what the crop removed, adjusted by tier
+            p_removal = yld * P_REMOVAL
+            k_removal = yld * K_REMOVAL
+            # Combined P+K maintenance rate (simplified — grower can fork to split)
+            base = int((p_removal + k_removal) * mult)
+            return max(FERT_MIN, min(FERT_MAX, base))
+
+        zones['rec_fertilizer_lbs'] = zones.apply(recommend_fert, axis=1)
+        zones['current_fertilizer_lbs'] = zones['applied_fert_rate'].fillna(zones['rec_fertilizer_lbs'].median()).astype(float)
+        zones['fertilizer_change'] = zones['rec_fertilizer_lbs'] - zones['current_fertilizer_lbs']
+
+        # Note soil test availability
+        soil_note = ""
+        if soil_tests is not None and len(soil_tests) > 0:
+            soil_note = f" | Soil tests available: {len(soil_tests)} zones"
+
+        # Save updated table back to workspace
+        save_df(zones, 'temp_rx_zones')
+
+        # Generate ISOXML for fertilizer prescription
+        rx_zones = [{'grid_id': str(r['zone_id']), 'rate': float(r['rec_fertilizer_lbs']),
+                      'unit': 'lbs/ac', 'geometry': str(r.get('geometry_wkt',''))}
+                     for _, r in zones.iterrows() if r.get('geometry_wkt')]
+        to_isoxml(rx_zones, f'rx_fertilizer_{{ crop_type }}_{{ year }}.xml',
+                  product_name=f'P+K Blend ({{ crop_type }})', task_name=f'VR Fertilizer {{ year }}')
+
+        # Summary
+        total = len(zones)
+        has_data = zones['applied_fert_rate'].notna().sum()
+        crop_label = 'Corn' if is_corn else 'Soybean'
+        print(f"=== Fertilizer Prescription: {crop_label} {{ year }} ===")
+        print(f"Zones: {total:,} | With fert data: {has_data} | Fields: {zones['field_name'].nunique()}{soil_note}")
+        print(f"Recommended rate range: {int(zones['rec_fertilizer_lbs'].min())} — {int(zones['rec_fertilizer_lbs'].max())} lbs/ac")
+        print(f"Based on yield-removal: P2O5 @ {P_REMOVAL} lb/bu + K2O @ {K_REMOVAL} lb/bu")
+        if has_data > 0:
+            changed = int((zones['fertilizer_change'].abs() > 15).sum())
+            print(f"Zones with adjustment >15 lbs: {changed}")
+        else:
+            print(f"No application history — using yield-removal defaults")
+        print(f"ISOXML download: rx_fertilizer_{{ crop_type }}_{{ year }}.xml")

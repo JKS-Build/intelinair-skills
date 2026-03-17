@@ -1,0 +1,48 @@
+<skill name="zone-map-prescription" version="2">
+  <purpose>
+    Generate variable-rate seeding prescriptions based on drainage-stratified
+    yield response data. Produces a downloadable ISOXML file compatible with
+    John Deere Operations Center and other ISO 11783 equipment.
+
+    Use when: grower asks about variable-rate seeding, wants to optimize
+    populations by field/zone, or needs a prescription file for their planter.
+  </purpose>
+
+  <interpretation>
+    <stage name="prescription_rates">
+      Recommended rates are derived from the DATA — the population bucket with
+      the highest weighted-average yield per drainage class. This is empirical,
+      not theoretical. If the data shows peak yield at 35K for well-drained,
+      that's what the prescription uses.
+
+      Zones with rate change less than 500 seeds/ac (corn) or 3,000 seeds/ac
+      (soybeans) are treated as "on target" — no meaningful adjustment needed.
+
+      The ISOXML file contains per-zone rates. When loaded into the planter
+      display, each zone gets its own seeding rate.
+    </stage>
+  </interpretation>
+
+  <communication>
+    Present the prescription as actionable:
+    "I've generated a variable-rate prescription for your [crop] based on
+    how each drainage class responds to different populations in your data.
+    [X] of [Y] zones have recommended rate changes. The ISOXML file is
+    ready to download and load into your planter display."
+
+    If most zones show no change, frame positively:
+    "Your current rates are well-matched to your fields. Only [X] zones
+    have meaningful adjustments."
+
+    Never present drainage-stratified rates as universal truth — they're
+    derived from THIS operation's data. Different operations may peak
+    at different populations.
+  </communication>
+
+  <follow_up>
+    After prescription generation, suggest:
+    "Want me to run the YP1K analysis to see which hybrids have the most
+    room for rate adjustment? That would give us the full picture —
+    hybrid-level recommendations on top of the zone-level prescription."
+  </follow_up>
+</skill>

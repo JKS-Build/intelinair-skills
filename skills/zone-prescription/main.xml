@@ -1,0 +1,84 @@
+<skill name="zone-prescription" version="1">
+  <purpose>
+    Generate variable-rate prescriptions for seed, nitrogen, and/or fertilizer
+    with zone-level map visualization and downloadable ISOXML files.
+
+    Use when: grower wants variable-rate prescriptions, asks to optimize
+    seeding/nitrogen/fertilizer rates by zone, needs a prescription file for
+    equipment (John Deere Operations Center, Climate FieldView, etc.), or
+    wants to see rate recommendations on a map.
+  </purpose>
+
+  <parameters>
+    <param name="prescription_types" required="true">
+      Comma-separated list of prescription types to generate.
+      Options: seed, nitrogen, fertilizer.
+      Ask the user which type(s) they want. If unclear, default to "seed".
+      Multiple types can be combined: "seed,nitrogen" generates both.
+    </param>
+    <param name="year" required="true">Crop year to analyze.</param>
+    <param name="crop_type" required="true">"corn" or "soybeans"</param>
+    <param name="company_id" required="true">
+      Company ID. REQUIRED for performance — without it the query scans
+      the entire database and will timeout.
+    </param>
+    <param name="field_name" required="false">
+      Optional filter to a single field. Omit for all fields in the company.
+    </param>
+  </parameters>
+
+  <interpretation>
+    <stage name="seed">
+      Seeding rate prescriptions use drainage-stratified yield response data.
+      For each drainage class, the population bucket with the highest
+      weighted-average yield becomes the recommended rate. This is empirical,
+      not theoretical — derived from THIS operation's actual data.
+
+      Zones with rate change less than 500 seeds/ac (corn) or 3,000 seeds/ac
+      (soybeans) are treated as "on target."
+    </stage>
+
+    <stage name="nitrogen">
+      Nitrogen prescriptions use application history correlated with yield
+      response. Zones are grouped by soil productivity tier and drainage class.
+      The N rate that produced peak yield in each group becomes the recommendation.
+      If no application data exists, soil-productivity-based defaults are used.
+    </stage>
+
+    <stage name="fertilizer">
+      Fertilizer prescriptions use yield-based nutrient removal rates adjusted
+      by soil productivity. Higher-yielding zones need more maintenance
+      fertility. Soil test data (if available) adjusts recommendations by
+      current nutrient levels.
+    </stage>
+  </interpretation>
+
+  <communication>
+    Present results as actionable:
+    "I've generated [type] prescriptions for your [crop]. The zone map shows
+    recommended rates across [N] zones ([M] acres). The ISOXML file is ready
+    to download and load into your planter/applicator display."
+
+    When multiple prescription types are combined:
+    "I've generated seed and nitrogen prescriptions. Use the layer switcher
+    on the zone map to toggle between seeding rate and N rate views. Both
+    prescriptions are included in the download file."
+
+    If most zones show no change from current rates, frame positively:
+    "Your current rates are well-matched. Only [X] zones have meaningful
+    adjustments — the rest are on target."
+
+    Never present rates as universal truth — they're derived from this
+    operation's specific data and conditions.
+  </communication>
+
+  <follow_up>
+    After prescription generation, offer:
+    - "Want me to run the YP1K analysis for a deeper look at hybrid-level
+      seeding rate efficiency?"
+    - "Should I export this as a shapefile for use in other GIS tools?"
+    - "Want to see how these rates compare to last year's application?"
+    - "You can fork this skill and customize the rate logic for your
+      specific agronomic approach — just ask me to help you modify it."
+  </follow_up>
+</skill>
