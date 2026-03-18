@@ -62,8 +62,9 @@ steps:
         zones['current_fertilizer_lbs'] = applied.where(applied > 0, zones['rec_fertilizer_lbs'].median())
         zones['fertilizer_change'] = zones['rec_fertilizer_lbs'] - zones['current_fertilizer_lbs']
 
-        # Save to DuckDB
-        create_temp_table(zones, 'temp_rx_zones')
+        # Save ONLY the prescription column as a small separate table
+        rx_fert = zones[['zone_id', 'rec_fertilizer_lbs', 'current_fertilizer_lbs', 'fertilizer_change']].copy()
+        create_temp_table(rx_fert, 'temp_rx_fertilizer')
 
         # Summary
         has_data = (applied > 0).sum()

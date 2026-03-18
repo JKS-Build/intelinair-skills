@@ -88,14 +88,22 @@ steps:
       table: temp_rx_zones
       code: |
         # df is auto-loaded from temp_rx_zones
-        rx_cols = [c for c in df.columns if c.startswith('rec_')]
+        zones = df.copy()
+        # Join any prescription tables that were created by reference plans
+        for rx_table in ['temp_rx_seed', 'temp_rx_nitrogen', 'temp_rx_fertilizer']:
+            try:
+                rx = sql_df(f'SELECT * FROM "{rx_table}"')
+                zones = zones.merge(rx, on='zone_id', how='left')
+            except:
+                pass  # This prescription type wasn't requested
+        rx_cols = [c for c in zones.columns if c.startswith('rec_')]
         crop_label = 'Corn' if '{{ crop_type }}' == 'corn' else 'Soybean'
         print(f"=== Prescription Summary: {crop_label} {{ year }} ===")
-        print(f"Zones: {len(df):,} | Fields: {df['field_name'].nunique()} | Acres: {df['acres'].sum():,.0f}")
+        print(f"Zones: {len(zones):,} | Fields: {zones['field_name'].nunique()} | Acres: {zones['acres'].sum():,.0f}")
         if rx_cols:
             print(f"Prescription layers: {', '.join(rx_cols)}")
             for col in rx_cols:
-                vals = df[col].dropna()
+                vals = zones[col].dropna()
                 if len(vals) > 0:
                     print(f"  {col}: {vals.min():.0f} — {vals.max():.0f} (avg {vals.mean():.0f})")
         else:

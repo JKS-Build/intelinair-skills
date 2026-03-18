@@ -81,4 +81,20 @@
     - "You can fork this skill and customize the rate logic for your
       specific agronomic approach — just ask me to help you modify it."
   </follow_up>
+
+  <post_execution>
+    After the skill finishes, you MUST do two things:
+
+    1. RENDER THE ZONE MAP: Call the write tool to display the prescription map:
+       write(type="artifact", component="zone-map", data=&lt;zones from temp_rx_zones&gt;,
+             config={color_by: "rec_seed_pop", title: "Seeding Rate Prescription"})
+       The zone map auto-detects all numeric columns as switchable layers.
+       Users can toggle between rec_seed_pop, rec_nitrogen_lbs, rec_fertilizer_lbs.
+
+    2. OFFER DOWNLOADS: If the user wants a prescription file, use the analyze tool
+       to generate ISOXML:
+       analyze(table="temp_rx_zones", code="to_isoxml(df.to_dict('records'), 'prescription.xml')")
+
+    These steps are NOT automated by the skill — you must call them explicitly.
+  </post_execution>
 </skill>

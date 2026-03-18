@@ -87,8 +87,9 @@ steps:
         zones['current_seed_pop'] = zones['planting_population'].fillna(zones['rec_seed_pop'].median()).astype(float)
         zones['seed_pop_change'] = zones['rec_seed_pop'] - zones['current_seed_pop']
 
-        # Save updated table back to DuckDB (workspace persistence happens via the tool)
-        create_temp_table(zones, 'temp_rx_zones')
+        # Save ONLY the prescription column as a small separate table
+        rx_seed = zones[['zone_id', 'rec_seed_pop', 'current_seed_pop', 'seed_pop_change']].copy()
+        create_temp_table(rx_seed, 'temp_rx_seed')
 
         # Summary
         threshold = 500 if is_corn else 3000
