@@ -56,27 +56,51 @@ steps:
           fp.soil_type, fp.soil_productivity, fp.drainage_class,
           fp.water_holding_capacity, fp.elevation, fp.slope,
           fp.harvest_yield, fp.crop_type,
-          ST_AsText(fp.zone_geometry) as geometry_wkt
+          ST_AsText(fp.zone_geometry) as geometry_wkt,
+          p.hybrid, p.brand, p.planting_population, p.seeding_rate,
+          a.as_applied_rate
         FROM field_properties fp
+        LEFT JOIN planting_events p
+          ON fp.field_id = p.field_id AND fp.zone_id = p.zone_id AND fp.year = p.year
+        LEFT JOIN (
+          SELECT field_id, zone_id, year,
+            MAX(as_applied_rate) as as_applied_rate
+          FROM application_events
+          WHERE as_applied_rate > 0
+          GROUP BY field_id, zone_id, year
+        ) a ON fp.field_id = a.field_id AND fp.zone_id = a.zone_id AND fp.year = a.year
         WHERE fp.year = {{ year }}
           AND CAST(fp.company_id AS VARCHAR) = '{{ company_id }}'
           AND fp.crop_type = '{{ crop_type }}'
           AND fp.zone_geometry IS NOT NULL
       table_name: temp_rx_zones
 
-  # Step 2: Render the combined zone map with all prescription layers
-  # This runs AFTER hooks have added rec_* columns to temp_rx_zones
+  # Step 2: Summarize results after all reference plans have run
+  # The agent renders the zone map after skill execution via
+  # write(type:"artifact", component:"zone-map", data:temp_rx_zones)
   - step: 2
-    id: render_map
-    tool: render
+    id: summary
+    tool: analyze
     input_tables: [temp_rx_zones]
-    timeout_ms: 60000
-    output: panel
+    timeout_ms: 30000
+    output: agent
     arguments:
-      component: zone-map
-      source_table: temp_rx_zones
-      color_by: harvest_yield
-      title: "Variable-Rate Prescription — {{ crop_type }} {{ year }}"
+      table: temp_rx_zones
+      code: |
+        # df is auto-loaded from temp_rx_zones
+        rx_cols = [c for c in df.columns if c.startswith('rec_')]
+        crop_label = 'Corn' if '{{ crop_type }}' == 'corn' else 'Soybean'
+        print(f"=== Prescription Summary: {crop_label} {{ year }} ===")
+        print(f"Zones: {len(df):,} | Fields: {df['field_name'].nunique()} | Acres: {df['acres'].sum():,.0f}")
+        if rx_cols:
+            print(f"Prescription layers: {', '.join(rx_cols)}")
+            for col in rx_cols:
+                vals = df[col].dropna()
+                if len(vals) > 0:
+                    print(f"  {col}: {vals.min():.0f} — {vals.max():.0f} (avg {vals.mean():.0f})")
+        else:
+            print("No prescription layers generated — check prescription_types parameter")
+        print(f"Use the zone map (write artifact) to visualize layers interactively.")
 
 hooks:
   # Chain reference plans based on prescription_types parameter

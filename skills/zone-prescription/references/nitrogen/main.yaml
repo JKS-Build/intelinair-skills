@@ -2,148 +2,66 @@ name: nitrogen-prescription
 description: >
   Variable-rate nitrogen prescription. Correlates application history with
   yield response by soil productivity tier and drainage class. Adds
-  rec_nitrogen_lbs column to workspace table and exports ISOXML.
+  rec_nitrogen_lbs column to workspace table.
 version: 1
 
 steps:
   - step: 1
     id: nitrogen_compute
     tool: analyze
-    input_tables: [temp_rx_zones]
+
     timeout_ms: 60000
     output: agent
     arguments:
       table: temp_rx_zones
-      raw_mode: true
-      code: |
-        import json
 
-        # Load zone data
-        zones = sql_df('SELECT * FROM "temp_rx_zones"')
+      code: |
+        # df is auto-loaded from temp_rx_zones (via table argument)
+        zones = df.copy()
         zones = zones.reset_index(drop=True)
+        import numpy as np
 
         is_corn = '{{ crop_type }}' == 'corn'
 
-        # Query nitrogen application data
-        apps = sql_df("""
-          SELECT
-            CAST(a.zone_id AS VARCHAR) as zone_id,
-            a.as_applied_rate,
-            a.harvest_yield as app_yield,
-            a.acres as app_acres,
-            a.product_types,
-            a.category_names
-          FROM application_events a
-          WHERE a.year = {{ year }}
-            AND CAST(a.company_id AS VARCHAR) = '{{ company_id }}'
-            AND a.crop_type = '{{ crop_type }}'
-            AND a.as_applied_rate > 0
-            AND (
-              a.product_types LIKE '%fertilizer%'
-              OR a.category_names LIKE '%nitrogen%'
-              OR a.category_names LIKE '%Nitrogen%'
-              OR a.category_names LIKE '%fertilizer%'
-              OR a.fertilizer_products IS NOT NULL
-            )
-        """)
-
-        # Merge N application data onto zones
-        if len(apps) > 0:
-            # Take the max application rate per zone (if multiple passes)
-            n_rates = apps.groupby('zone_id').agg(
-                applied_n_rate=('as_applied_rate', 'max'),
-                n_yield=('app_yield', 'max')
-            ).reset_index()
-            zones = zones.merge(n_rates, on='zone_id', how='left')
-        else:
-            zones['applied_n_rate'] = None
-            zones['n_yield'] = None
-
-        # Soil-productivity-based N rate recommendations
-        # These are agronomic defaults when application data is sparse
-        # Corn: 0.9-1.2 lbs N per bushel of yield goal
-        # Soybeans: generally don't need supplemental N (fixation)
-        def get_tier(sp):
-            sp = float(sp or 0)
-            if sp > 0.82: return 'A'
-            if sp > 0.72: return 'B'
-            if sp > 0.62: return 'C'
-            return 'D'
+        # Vectorized N rate computation
+        sp = zones['soil_productivity'].fillna(0.7).astype(float)
+        yld = zones['harvest_yield'].fillna(0).astype(float)
+        dc = zones['drainage_class'].fillna('Unknown').astype(str)
+        applied = zones['as_applied_rate'].fillna(0).astype(float)
 
         if is_corn:
-            # N rate by tier: better soil = higher yield goal = more N
-            tier_n_defaults = {'A': 200, 'B': 180, 'C': 160, 'D': 140}
             N_MIN, N_MAX = 100, 250
+            # Yield-based: MRTN ~1.1 lb N per bushel
+            base_n = np.where(yld > 0, yld * 1.1,
+                     np.where(sp > 0.82, 200, np.where(sp > 0.72, 185, np.where(sp > 0.62, 165, 145))))
+            # Drainage adjustment: poorly drained +10%, well drained -5%
+            drain_mult = np.where(dc.str.contains('poorly', case=False, na=False), 1.10,
+                         np.where(dc.str.contains('Well drained', case=False, na=False) & ~dc.str.contains('Moderate', case=False, na=False), 0.95, 1.0))
+            # OM/soil productivity adjustment: high prod soils have more natural N
+            om_mult = np.where(sp > 0.85, 0.90, 1.0)
+            zones['rec_nitrogen_lbs'] = (base_n * drain_mult * om_mult).clip(N_MIN, N_MAX).round().astype(int)
         else:
-            # Soybeans: minimal N, primarily starter
-            tier_n_defaults = {'A': 20, 'B': 20, 'C': 15, 'D': 10}
-            N_MIN, N_MAX = 0, 40
+            # Soybeans: minimal N (starter only)
+            zones['rec_nitrogen_lbs'] = np.where(sp > 0.72, 20, 15).astype(int)
 
-        # Find optimal N rate per soil tier from application data
-        tier_optimal = {}
-        for _, row in zones.iterrows():
-            tier = get_tier(row.get('soil_productivity'))
-            n_rate = row.get('applied_n_rate')
-            yld = float(row.get('n_yield') or row.get('harvest_yield') or 0)
-            ac = float(row.get('acres') or 1)
-            if n_rate is None or yld <= 0:
-                continue
-            n_rate = float(n_rate)
-            bucket = round(n_rate / 10) * 10  # 10 lb buckets
-            key = (tier, bucket)
-            if key not in tier_optimal:
-                tier_optimal[key] = {'yield_sum': 0, 'acres_sum': 0, 'count': 0}
-            g = tier_optimal[key]
-            g['yield_sum'] += yld * ac
-            g['acres_sum'] += ac
-            g['count'] += 1
-
-        # Find peak-yield N rate per tier
-        tier_best_n = {}
-        for (tier, bucket), g in tier_optimal.items():
-            if g['count'] >= 2:
-                avg_yld = g['yield_sum'] / g['acres_sum']
-                if tier not in tier_best_n or avg_yld > tier_best_n[tier][0]:
-                    tier_best_n[tier] = (avg_yld, bucket)
-
-        def recommend_n(row):
-            tier = get_tier(row.get('soil_productivity'))
-            if tier in tier_best_n:
-                base = tier_best_n[tier][1]
-            else:
-                base = tier_n_defaults.get(tier, 180 if is_corn else 20)
-            # Drainage adjustment: poorly drained soils lose more N
-            dc = str(row.get('drainage_class') or '')
-            if 'poorly' in dc.lower():
-                base = int(base * 1.10)  # 10% increase for poor drainage
-            elif 'well' in dc.lower() and 'moderate' not in dc.lower():
-                base = int(base * 0.95)  # 5% decrease for well-drained (less loss)
-            return max(N_MIN, min(N_MAX, int(base)))
-
-        zones['rec_nitrogen_lbs'] = zones.apply(recommend_n, axis=1)
-        zones['current_nitrogen_lbs'] = zones['applied_n_rate'].fillna(zones['rec_nitrogen_lbs'].median()).astype(float)
+        zones['current_nitrogen_lbs'] = applied.where(applied > 0, zones['rec_nitrogen_lbs'].median())
         zones['nitrogen_change'] = zones['rec_nitrogen_lbs'] - zones['current_nitrogen_lbs']
 
-        # Save updated table back to workspace
-        save_df(zones, 'temp_rx_zones')
-
-        # Generate ISOXML for nitrogen prescription
-        rx_zones = [{'grid_id': str(r['zone_id']), 'rate': float(r['rec_nitrogen_lbs']),
-                      'unit': 'lbs/ac', 'geometry': str(r.get('geometry_wkt',''))}
-                     for _, r in zones.iterrows() if r.get('geometry_wkt')]
-        to_isoxml(rx_zones, f'rx_nitrogen_{{ crop_type }}_{{ year }}.xml',
-                  product_name=f'Nitrogen ({{ crop_type }})', task_name=f'VR Nitrogen {{ year }}')
+        # Save to DuckDB
+        create_temp_table(zones, 'temp_rx_zones')
 
         # Summary
-        has_data = zones['applied_n_rate'].notna().sum()
+        has_data = (applied > 0).sum()
         total = len(zones)
         crop_label = 'Corn' if is_corn else 'Soybean'
         print(f"=== Nitrogen Prescription: {crop_label} {{ year }} ===")
-        print(f"Zones: {total:,} | With N data: {has_data} | Fields: {zones['field_name'].nunique()}")
+        print(f"Zones: {total:,} | With N data: {int(has_data)} | Fields: {zones['field_name'].nunique()}")
         print(f"Recommended N range: {int(zones['rec_nitrogen_lbs'].min())} — {int(zones['rec_nitrogen_lbs'].max())} lbs/ac")
         if has_data > 0:
             changed = int((zones['nitrogen_change'].abs() > 10).sum())
             print(f"Zones with N adjustment >10 lbs: {changed}")
         else:
-            print(f"No application history found — using soil-based defaults")
-        print(f"ISOXML download: rx_nitrogen_{{ crop_type }}_{{ year }}.xml")
+            print(f"No application history — using MRTN-based defaults (~1.1 lb N/bu)")
+        print(f"N rate: MRTN approximation (~1.1 lb N/bu yield goal)")
+        print(f"Drainage: poorly drained +10%, well drained -5%")
+        print(f"High-OM soils (prod >0.85): -10% (natural N supply)")

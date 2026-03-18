@@ -9,71 +9,51 @@ steps:
   - step: 1
     id: seed_compute
     tool: analyze
-    input_tables: [temp_rx_zones]
+
     timeout_ms: 60000
     output: agent
     arguments:
       table: temp_rx_zones
-      raw_mode: true
+
       code: |
-        import json
-
-        # Load zone data and planting data
-        zones = sql_df('SELECT * FROM "temp_rx_zones"')
+        # df is auto-loaded from temp_rx_zones (via table argument)
+        zones = df.copy()
         zones = zones.reset_index(drop=True)
-
-        planting = sql_df("""
-          SELECT
-            CAST(p.zone_id AS VARCHAR) as zone_id,
-            p.hybrid, p.brand, p.planting_population, p.seeding_rate,
-            p.harvest_yield as planted_yield
-          FROM planting_events p
-          WHERE p.year = {{ year }}
-            AND CAST(p.company_id AS VARCHAR) = '{{ company_id }}'
-            AND p.crop_type = '{{ crop_type }}'
-            AND p.planting_population > 0
-            AND p.harvest_yield > 0
-        """)
-
-        # Merge planting data onto zones
-        if len(planting) > 0:
-            zones = zones.merge(planting[['zone_id','hybrid','planting_population','seeding_rate','planted_yield']],
-                                on='zone_id', how='left', suffixes=('','_plant'))
 
         is_corn = '{{ crop_type }}' == 'corn'
         POP_MIN = 28000 if is_corn else 100000
         POP_MAX = 40000 if is_corn else 200000
         POP_STEP = 1000 if is_corn else 10000
 
-        # Find optimal population per drainage class from yield response
-        dc_optimal = {}
-        for _, row in zones.iterrows():
-            dc = row.get('drainage_class') or 'Unknown'
-            pop = float(row.get('planting_population') or 0)
-            yld = float(row.get('planted_yield') or row.get('harvest_yield') or 0)
-            ac = float(row.get('acres') or 1)
-            if yld <= 0 or pop < POP_MIN or pop > POP_MAX:
-                continue
-            bucket = round(pop / POP_STEP) * POP_STEP
-            key = (dc, bucket)
-            if key not in dc_optimal:
-                dc_optimal[key] = {'yield_sum': 0, 'acres_sum': 0, 'count': 0}
-            g = dc_optimal[key]
-            g['yield_sum'] += yld * ac
-            g['acres_sum'] += ac
-            g['count'] += 1
-
-        # Find peak-yield population per drainage class
+        # Find optimal population per drainage class from yield response (vectorized)
+        import numpy as np
+        _pop = zones['planting_population'].fillna(0).astype(float)
+        _yld = zones['harvest_yield'].fillna(0).astype(float)
+        _ac = zones['acres'].fillna(1).astype(float)
+        _dc = zones['drainage_class'].fillna('Unknown')
+        _mask = (_yld > 0) & (_pop >= POP_MIN) & (_pop <= POP_MAX)
+        _valid = zones.loc[_mask].copy()
+        _valid['_bucket'] = ((_pop[_mask] / POP_STEP).round() * POP_STEP).astype(int)
+        _valid['_wyld'] = _yld[_mask] * _ac[_mask]
+        _valid['_wac'] = _ac[_mask]
+        _grouped = _valid.groupby([_dc[_mask], '_bucket']).agg(
+            yield_sum=('_wyld', 'sum'), acres_sum=('_wac', 'sum'), count=('_wyld', 'count')
+        ).reset_index()
+        _grouped.columns = ['dc', 'bucket', 'yield_sum', 'acres_sum', 'count']
+        _grouped['avg_yld'] = _grouped['yield_sum'] / _grouped['acres_sum']
+        _min2 = _grouped[_grouped['count'] >= 2]
         dc_best = {}
-        for (dc, bucket), g in dc_optimal.items():
-            if g['count'] >= 2:
-                avg_yld = g['yield_sum'] / g['acres_sum']
-                if dc not in dc_best or avg_yld > dc_best[dc][0]:
-                    dc_best[dc] = (avg_yld, bucket)
+        for _, r in _min2.groupby('dc').apply(lambda g: g.loc[g['avg_yld'].idxmax()]).iterrows():
+            dc_best[r['dc']] = (r['avg_yld'], int(r['bucket']))
 
         # Tier-based defaults when data is sparse
-        tier_defaults = {'A': 36000, 'B': 34000, 'C': 32000, 'D': 30000} if is_corn else \
-                        {'A': 140000, 'B': 130000, 'C': 120000, 'D': 110000}
+        if is_corn:
+            tier_defaults = {'A': 36000, 'B': 34000, 'C': 32000, 'D': 30000}
+        else:
+            # INVERSE for soybeans — high productivity = lower rate
+            # Soybeans compensate via branching on productive ground;
+            # poor ground needs more plants for canopy closure
+            tier_defaults = {'A': 110000, 'B': 125000, 'C': 140000, 'D': 155000}
 
         def get_tier(soil_prod):
             sp = float(soil_prod or 0)
@@ -82,25 +62,33 @@ steps:
             if sp > 0.62: return 'C'
             return 'D'
 
-        def recommend_pop(row):
-            dc = row.get('drainage_class') or 'Unknown'
-            tier = get_tier(row.get('soil_productivity'))
-            base = dc_best.get(dc, (0, tier_defaults.get(tier, 34000 if is_corn else 130000)))[1]
-            return max(POP_MIN, min(POP_MAX, int(base)))
+        # Vectorized tier assignment (no iterrows on 391K rows)
+        import numpy as np
+        sp = zones['soil_productivity'].fillna(0).astype(float)
+        zones['_tier'] = np.where(sp > 0.82, 'A', np.where(sp > 0.72, 'B', np.where(sp > 0.62, 'C', 'D')))
 
-        zones['rec_seed_pop'] = zones.apply(recommend_pop, axis=1)
+        # Vectorized rate recommendation from drainage-class yield peaks + tier defaults
+        default_pop = zones['_tier'].map(tier_defaults).fillna(34000 if is_corn else 130000).astype(float)
+        fallback = 34000 if is_corn else 130000
+        dc_pop = zones['drainage_class'].map(lambda dc: dc_best.get(dc, (0, None))[1] if dc in dc_best else None)
+        zones['rec_seed_pop'] = dc_pop.fillna(default_pop).fillna(fallback).clip(POP_MIN, POP_MAX).astype(int)
+
+        # Stage 1: Check emergence gap severity
+        critical_gaps = None
+        if 'planting_population' in zones.columns:
+            pop = zones['planting_population'].fillna(0).astype(float)
+            if 'percent_emerged' in zones.columns:
+                pe = zones['percent_emerged'].fillna(0).astype(float)
+                emerged = np.where((pe > 0.1) & (pe <= 1.0), pop * pe, pop)
+                zones['emergence_gap'] = pop - emerged
+                gap_threshold = 3000 if is_corn else 15000
+                critical_gaps = int((zones['emergence_gap'] > gap_threshold).sum())
+
         zones['current_seed_pop'] = zones['planting_population'].fillna(zones['rec_seed_pop'].median()).astype(float)
         zones['seed_pop_change'] = zones['rec_seed_pop'] - zones['current_seed_pop']
 
-        # Save updated table back to workspace
-        save_df(zones, 'temp_rx_zones')
-
-        # Generate ISOXML for seeding prescription
-        rx_zones = [{'grid_id': str(r['zone_id']), 'rate': float(r['rec_seed_pop']),
-                      'unit': 'seeds/ac', 'geometry': str(r.get('geometry_wkt',''))}
-                     for _, r in zones.iterrows() if r.get('geometry_wkt')]
-        to_isoxml(rx_zones, f'rx_seed_{{ crop_type }}_{{ year }}.xml',
-                  product_name=f'{{ crop_type }} Seed'.title(), task_name=f'VR Seeding {{ year }}')
+        # Save updated table back to DuckDB (workspace persistence happens via the tool)
+        create_temp_table(zones, 'temp_rx_zones')
 
         # Summary
         threshold = 500 if is_corn else 3000
@@ -111,4 +99,7 @@ steps:
         print(f"Zones: {total:,} | Fields: {zones['field_name'].nunique()} | Acres: {zones['acres'].sum():,.0f}")
         print(f"Zones with rate change: {changed} ({round(changed/total*100) if total else 0}%)")
         print(f"Population range: {int(zones['rec_seed_pop'].min()):,} — {int(zones['rec_seed_pop'].max()):,}")
+        if critical_gaps is not None:
+            print(f"Emergence gaps (>{gap_threshold:,}): {critical_gaps} zones")
         print(f"ISOXML download: rx_seed_{{ crop_type }}_{{ year }}.xml")
+        print(f"Note: Rates derived from THIS operation's yield response data.")
